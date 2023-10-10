@@ -4,7 +4,12 @@ local util = require("vim.lsp.util")
 
 local M = {}
 
-local function apply_text_edits(text_edits, bufnr, offset_encoding)
+---@param text_edits lsp.TextEdit[]
+---@param bufnr integer
+---@param offset_encoding string
+---@param range conform.Range?
+---@param only_range boolean?
+local function apply_text_edits(text_edits, bufnr, offset_encoding, range, only_range)
   if
     #text_edits == 1
     and text_edits[1].range.start.line == 0
@@ -18,16 +23,24 @@ local function apply_text_edits(text_edits, bufnr, offset_encoding)
     if #new_lines > 1 and new_lines[#new_lines] == "" then
       table.remove(new_lines)
     end
-    require("conform.runner").apply_format(bufnr, original_lines, new_lines, nil, false)
-  else
+    require("conform.runner").apply_format(
+      bufnr,
+      original_lines,
+      new_lines,
+      range,
+      only_range == true
+    )
+  elseif not only_range then
     vim.lsp.util.apply_text_edits(text_edits, bufnr, offset_encoding)
+  elseif #text_edits > 1 then
+    log.warn("don't know how to limit multiple LSP textEdits to a range; skipping")
   end
 end
 
 ---@param options table
 ---@return table[] clients
 function M.get_format_clients(options)
-  local method = options.range and "textDocument/rangeFormatting" or "textDocument/formatting"
+  local method = "textDocument/formatting"
 
   local clients = vim.lsp.get_active_clients({
     id = options.id,
@@ -68,6 +81,10 @@ function M.format(options, callback)
     return params
   end
 
+  local function supports_range(client)
+    return client.supports_method("textDocument/rangeFormatting", { bufnr = bufnr })
+  end
+
   if options.async then
     local changedtick = vim.b[bufnr].changedtick
     local do_format
@@ -85,7 +102,10 @@ function M.format(options, callback)
           end
         end,
       })
-      client.request(method, params, function(err, result, ctx, _)
+      local range_supported =
+        client.supports_method("textDocument/rangeFormatting", { bufnr = bufnr })
+      local lsp_method = range_supported and method or "textDocument/formatting"
+      client.request(lsp_method, params, function(err, result, ctx, _)
         vim.api.nvim_del_autocmd(auto_id)
         if not result then
           return callback(err or "No result returned from LSP formatter")
@@ -100,7 +120,13 @@ function M.format(options, callback)
             )
           )
         else
-          apply_text_edits(result, ctx.bufnr, client.offset_encoding)
+          apply_text_edits(
+            result,
+            ctx.bufnr,
+            client.offset_encoding,
+            range,
+            range ~= nil and not range_supported
+          )
           changedtick = vim.b[bufnr].changedtick
 
           do_format(next(clients, idx))
@@ -112,9 +138,18 @@ function M.format(options, callback)
     local timeout_ms = options.timeout_ms or 1000
     for _, client in pairs(clients) do
       local params = set_range(client, util.make_formatting_params(options.formatting_options))
-      local result, err = client.request_sync(method, params, timeout_ms, bufnr)
+      local range_supported =
+        client.supports_method("textDocument/rangeFormatting", { bufnr = bufnr })
+      local lsp_method = range_supported and method or "textDocument/formatting"
+      local result, err = client.request_sync(lsp_method, params, timeout_ms, bufnr)
       if result and result.result then
-        apply_text_edits(result.result, bufnr, client.offset_encoding)
+        apply_text_edits(
+          result.result,
+          bufnr,
+          client.offset_encoding,
+          range,
+          range ~= nil and not range_supported
+        )
       elseif err then
         if not options.quiet then
           vim.notify(string.format("[LSP][%s] %s", client.name, err), vim.log.levels.WARN)
